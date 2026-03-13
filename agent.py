@@ -3,13 +3,6 @@ from typing import List
 import os
 
 from pipecat.observers.base_observer import BaseObserver, FramePushed
-from pipecat.services.openai.realtime.events import (
-    ConversationItem,
-    ConversationItemCreateEvent,
-    ItemContent,
-)
-from typing_extensions import override
-
 from dotenv import load_dotenv
 from loguru import logger
 from pipecat.audio.vad.silero import SileroVADAnalyzer
@@ -20,7 +13,6 @@ from pipecat.frames.frames import (
     CancelFrame,
     EndFrame,
     LLMMessagesAppendFrame,
-    LLMRunFrame,
     UserStartedSpeakingFrame, StartFrame,
 )
 from pipecat.pipeline.pipeline import Pipeline
@@ -32,7 +24,6 @@ from pipecat.processors.aggregators.llm_response_universal import (
     LLMUserAggregatorParams,
 )
 from pipecat.serializers.protobuf import ProtobufFrameSerializer
-from pipecat.services.openai.realtime.llm import OpenAIRealtimeLLMService
 from pipecat.services.openai.llm import OpenAILLMService
 from pipecat.services.openai.stt import OpenAIRealtimeSTTService
 from pipecat.services.openai.tts import OpenAITTSService
