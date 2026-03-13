@@ -40,8 +40,6 @@ from pipecat.transports.websocket.fastapi import FastAPIWebsocketParams, FastAPI
 
 load_dotenv(override=True)
 
-_frame_log_file = open("frame_log.txt", "a", buffering=1)
-
 
 SLIDE_SYSTEM_MESSAGES: List[str] = [
     # Slide 1 – welcome & overview
