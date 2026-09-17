@@ -1,6 +1,11 @@
 ## Tutor Bot
 Tutor bot is an MVP for an AI agent which teaches a class of students about natural disasters.
 
+### About this repo
+Code is not guaranteed to work, rather should be treated is a starting point of the project. A submission for this assignment may change anything and everything about this code, with following limitations:
+- Submission must not use any other framework, other than pipecat.
+- Submission must not connect to any other external service, other than API.
+
 ### Acceptance Criteria
 Update existing agent code in such a way that following goals are met, while keeping conversation human-like and safe for students.
 
@@ -15,7 +20,7 @@ Update existing agent code in such a way that following goals are met, while kee
 - Should log a metric report with information such as average latency, tokens consumed, etc. on console after user disconnects.
 
 ### Open Ended Goals
-Architecturally, there must exist a way where agent's own old transcripts can be used to improve it's behavior.
+There must exist some way where agent's own old transcripts can be used to improve it's behavior.
 
 ### Local Setup
 #### Setup Agent
