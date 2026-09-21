@@ -3,28 +3,69 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>AI Chatbot</title>
+    <title>Tutor Bot · Natural Disasters</title>
+    <link rel="stylesheet" href="./style.css" />
   </head>
 
   <body>
-    <div class="container">
-      <div class="status-bar">
-        <div class="status">Transport: <span id="connection-status">Disconnected</span></div>
-        <div class="controls">
-          <button id="connect-btn">Connect</button>
-          <button id="disconnect-btn" disabled>Disconnect</button>
+    <div class="app">
+      <header class="topbar">
+        <div class="brand">
+          <span class="brand-mark">TB</span>
+          <div>
+            <h1>Tutor Bot</h1>
+            <p>Natural Disasters · live spoken lesson</p>
+          </div>
         </div>
-      </div>
+        <div class="status">
+          <span id="status-dot" class="dot dot-off"></span>
+          <span id="connection-status">Disconnected</span>
+        </div>
+      </header>
 
-      <audio id="bot-audio" autoplay></audio>
+      <section class="controls">
+        <button id="connect-btn" class="btn btn-primary">Connect</button>
+        <button id="pause-btn" class="btn" disabled>Pause</button>
+        <button id="resume-btn" class="btn" disabled>Resume</button>
+        <button id="disconnect-btn" class="btn btn-danger" disabled>Disconnect</button>
+        <span class="hint">Use headphones so the bot doesn't hear itself.</span>
+      </section>
 
-      <div class="debug-panel">
-        <h3>Debug Info</h3>
-        <div id="debug-log"></div>
-      </div>
+      <main class="grid">
+        <section class="card lesson">
+          <div class="lesson-head">
+            <span id="mode-badge" class="badge badge-idle">Idle</span>
+            <span id="slide-counter" class="counter">Slide – / –</span>
+          </div>
+          <div class="progress"><div id="progress-bar" class="progress-bar"></div></div>
+          <h2 id="slide-title">Press Connect to start the lesson</h2>
+          <ul id="talking-points" class="points"></ul>
+          <div id="speaking-indicator" class="speaking hidden">
+            <span class="wave"></span><span class="wave"></span><span class="wave"></span>
+            <span>Sam is speaking</span>
+          </div>
+          <div id="paused-banner" class="paused-banner hidden">Lesson paused. The bot will continue exactly where it stopped.</div>
+        </section>
+
+        <section class="card transcript">
+          <h3>Transcript</h3>
+          <div id="transcript"></div>
+        </section>
+
+        <section id="report-card" class="card report hidden">
+          <h3>Session metrics</h3>
+          <pre id="report"></pre>
+        </section>
+
+        <section class="card log">
+          <details>
+            <summary>Debug log</summary>
+            <div id="debug-log"></div>
+          </details>
+        </section>
+      </main>
     </div>
 
     <script type="module" src="./app.ts"></script>
-    <link rel="stylesheet" href="./style.css" />
   </body>
 </html>

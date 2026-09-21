@@ -1,244 +1,274 @@
 /**
- * Copyright (c) 2024–2025, Daily
+ * Tutor Bot frontend: connects to the Pipecat agent over WebSocket, shows the
+ * lesson state pushed by the server, and drives pause / resume.
  *
- * SPDX-License-Identifier: BSD 2-Clause License
+ * Pause is two-layered: the server buffers the bot's output (authoritative), and
+ * the browser suspends its AudioContext so already-received audio stops instantly
+ * and resumes sample-exact.
  */
 
-/**
- * Pipecat Client Implementation
- *
- * This client connects to an RTVI-compatible bot server using WebSocket.
- *
- * Requirements:
- * - A running RTVI bot server (defaults to http://localhost:7860)
- */
+import { PipecatClient, type PipecatClientOptions } from '@pipecat-ai/client-js';
+import { WavMediaManager, WebSocketTransport } from '@pipecat-ai/websocket-transport';
 
-import {
-    PipecatClient,
-    type PipecatClientOptions,
-    RTVIEvent,
-} from '@pipecat-ai/client-js';
-import { WebSocketTransport } from '@pipecat-ai/websocket-transport';
+const SERVER = 'http://localhost:7860';
 
-class WebsocketClientApp {
-    private pcClient: PipecatClient | null = null;
-    private connectBtn: HTMLButtonElement | null = null;
-    private disconnectBtn: HTMLButtonElement | null = null;
-    private statusSpan: HTMLElement | null = null;
-    private debugLog: HTMLElement | null = null;
-    private botAudio: HTMLAudioElement;
+type LessonState = {
+    type: 'state';
+    mode: 'idle' | 'presenting' | 'qna' | 'ended';
+    paused: boolean;
+    slide_number: number;
+    total_slides: number;
+    slide_title: string | null;
+    talking_points: string[];
+    completed_slides: number[];
+    bot_speaking?: boolean;
+};
+
+class PausableMediaManager extends WavMediaManager {
+    private get audioContext(): AudioContext | undefined {
+        // WavMediaManager keeps its player private; the context is what we need to freeze.
+        return (this as any)._wavStreamPlayer?.context as AudioContext | undefined;
+    }
+
+    async pausePlayback(): Promise<void> {
+        const ctx = this.audioContext;
+        if (ctx && ctx.state === 'running') await ctx.suspend();
+    }
+
+    async resumePlayback(): Promise<void> {
+        const ctx = this.audioContext;
+        if (ctx && ctx.state === 'suspended') await ctx.resume();
+    }
+}
+
+class TutorApp {
+    private client: PipecatClient | null = null;
+    private media: PausableMediaManager | null = null;
+    private paused = false;
+    private botLine: HTMLElement | null = null;
+
+    private el = {
+        connect: document.getElementById('connect-btn') as HTMLButtonElement,
+        disconnect: document.getElementById('disconnect-btn') as HTMLButtonElement,
+        pause: document.getElementById('pause-btn') as HTMLButtonElement,
+        resume: document.getElementById('resume-btn') as HTMLButtonElement,
+        status: document.getElementById('connection-status')!,
+        dot: document.getElementById('status-dot')!,
+        mode: document.getElementById('mode-badge')!,
+        counter: document.getElementById('slide-counter')!,
+        progress: document.getElementById('progress-bar')!,
+        title: document.getElementById('slide-title')!,
+        points: document.getElementById('talking-points')!,
+        speaking: document.getElementById('speaking-indicator')!,
+        pausedBanner: document.getElementById('paused-banner')!,
+        transcript: document.getElementById('transcript')!,
+        reportCard: document.getElementById('report-card')!,
+        report: document.getElementById('report')!,
+        debug: document.getElementById('debug-log')!,
+    };
 
     constructor() {
-        console.log('WebsocketClientApp');
-        this.botAudio = document.createElement('audio');
-        this.botAudio.autoplay = true;
-        //this.botAudio.playsInline = true;
-        document.body.appendChild(this.botAudio);
-
-        this.setupDOMElements();
-        this.setupEventListeners();
+        this.el.connect.addEventListener('click', () => this.connect());
+        this.el.disconnect.addEventListener('click', () => this.disconnect());
+        this.el.pause.addEventListener('click', () => this.pause());
+        this.el.resume.addEventListener('click', () => this.resume());
     }
 
-    /**
-     * Set up references to DOM elements and create necessary media elements
-     */
-    private setupDOMElements(): void {
-        this.connectBtn = document.getElementById(
-            'connect-btn'
-        ) as HTMLButtonElement;
-        this.disconnectBtn = document.getElementById(
-            'disconnect-btn'
-        ) as HTMLButtonElement;
-        this.statusSpan = document.getElementById('connection-status');
-        this.debugLog = document.getElementById('debug-log');
-    }
+    // ---- UI helpers -------------------------------------------------------
 
-    /**
-     * Set up event listeners for connect/disconnect buttons
-     */
-    private setupEventListeners(): void {
-        this.connectBtn?.addEventListener('click', () => this.connect());
-        this.disconnectBtn?.addEventListener('click', () => this.disconnect());
-    }
-
-    /**
-     * Add a timestamped message to the debug log
-     */
     private log(message: string): void {
-        if (!this.debugLog) return;
         const entry = document.createElement('div');
-        entry.textContent = `${new Date().toISOString()} - ${message}`;
-        if (message.startsWith('User: ')) {
-            entry.style.color = '#2196F3';
-        } else if (message.startsWith('Bot: ')) {
-            entry.style.color = '#4CAF50';
-        }
-        this.debugLog.appendChild(entry);
-        this.debugLog.scrollTop = this.debugLog.scrollHeight;
+        entry.textContent = `${new Date().toLocaleTimeString()} ${message}`;
+        this.el.debug.appendChild(entry);
+        this.el.debug.scrollTop = this.el.debug.scrollHeight;
         console.log(message);
     }
 
-    /**
-     * Update the connection status display
-     */
-    private updateStatus(status: string): void {
-        if (this.statusSpan) {
-            this.statusSpan.textContent = status;
-        }
-        this.log(`Status: ${status}`);
+    private setStatus(text: string, dot: 'off' | 'on' | 'warn'): void {
+        this.el.status.textContent = text;
+        this.el.dot.className = `dot dot-${dot}`;
     }
 
-    /**
-     * Check for available media tracks and set them up if present
-     * This is called when the bot is ready or when the transport state changes to ready
-     */
-    setupMediaTracks() {
-        if (!this.pcClient) return;
-        const tracks = this.pcClient.tracks();
-        if (tracks.bot?.audio) {
-            this.setupAudioTrack(tracks.bot.audio);
-        }
+    private setButtons(connected: boolean): void {
+        this.el.connect.disabled = connected;
+        this.el.disconnect.disabled = !connected;
+        this.el.pause.disabled = !connected || this.paused;
+        this.el.resume.disabled = !connected || !this.paused;
     }
 
-    /**
-     * Set up listeners for track events (start/stop)
-     * This handles new tracks being added during the session
-     */
-    setupTrackListeners() {
-        if (!this.pcClient) return;
+    private addTranscript(kind: 'user' | 'bot' | 'sys', text: string): HTMLElement {
+        const line = document.createElement('div');
+        line.className = `msg msg-${kind}`;
+        line.textContent = text;
+        this.el.transcript.appendChild(line);
+        this.el.transcript.scrollTop = this.el.transcript.scrollHeight;
+        return line;
+    }
 
-        // Listen for new tracks starting
-        this.pcClient.on(RTVIEvent.TrackStarted, (track, participant) => {
-            // Only handle non-local (bot) tracks
-            if (!participant?.local && track.kind === 'audio') {
-                this.setupAudioTrack(track);
-            }
-        });
+    private renderState(state: LessonState): void {
+        const label = state.paused ? 'paused' : state.mode;
+        this.el.mode.className = `badge badge-${label}`;
+        this.el.mode.textContent = state.paused ? 'Paused' : ({ idle: 'Idle', presenting: 'Presenting', qna: 'Q&A', ended: 'Ended' } as const)[state.mode];
 
-        // Listen for tracks stopping
-        this.pcClient.on(RTVIEvent.TrackStopped, (track, participant) => {
-            this.log(
-                `Track stopped: ${track.kind} from ${participant?.name || 'unknown'}`
+        if (state.slide_number > 0) {
+            this.el.counter.textContent = `Slide ${state.slide_number} / ${state.total_slides}`;
+            this.el.progress.style.width = `${(state.completed_slides.length / state.total_slides) * 100}%`;
+            this.el.title.textContent = state.slide_title ?? '';
+            this.el.points.replaceChildren(
+                ...state.talking_points.map((p) => {
+                    const li = document.createElement('li');
+                    li.textContent = p;
+                    return li;
+                })
             );
-        });
-    }
-
-    /**
-     * Set up an audio track for playback
-     * Handles both initial setup and track updates
-     */
-    private setupAudioTrack(track: MediaStreamTrack): void {
-        this.log('Setting up audio track');
-        if (
-            this.botAudio.srcObject &&
-            'getAudioTracks' in this.botAudio.srcObject
-        ) {
-            const oldTrack = this.botAudio.srcObject.getAudioTracks()[0];
-            if (oldTrack?.id === track.id) return;
         }
-        this.botAudio.srcObject = new MediaStream([track]);
+        if (state.mode === 'qna') {
+            this.el.title.textContent = 'Q&A — ask anything, or ask to revisit a slide';
+        } else if (state.mode === 'ended') {
+            this.el.title.textContent = 'Lesson finished';
+        }
+        this.el.speaking.classList.toggle('hidden', !state.bot_speaking || state.paused);
+        this.el.pausedBanner.classList.toggle('hidden', !state.paused);
+        this.paused = state.paused;
+        this.setButtons(this.client !== null);
     }
 
-    /**
-     * Initialize and connect to the bot
-     * This sets up the Pipecat client, initializes devices, and establishes the connection
-     */
-    public async connect(): Promise<void> {
-        try {
-            const startTime = Date.now();
+    // ---- connection -------------------------------------------------------
 
-            //const transport = new DailyTransport();
-            const PipecatConfig: PipecatClientOptions = {
-                transport: new WebSocketTransport(),
-                enableMic: true,
-                enableCam: false,
-                callbacks: {
-                    onConnected: () => {
-                        this.updateStatus('Connected');
-                        if (this.connectBtn) this.connectBtn.disabled = true;
-                        if (this.disconnectBtn) this.disconnectBtn.disabled = false;
-                    },
-                    onDisconnected: () => {
-                        this.updateStatus('Disconnected');
-                        if (this.connectBtn) this.connectBtn.disabled = false;
-                        if (this.disconnectBtn) this.disconnectBtn.disabled = true;
-                        this.log('Client disconnected');
-                    },
-                    onBotReady: (data) => {
-                        this.log(`Bot ready: ${JSON.stringify(data)}`);
-                        this.setupMediaTracks();
-                    },
-                    onUserTranscript: (data) => {
-                        if (data.final) {
-                            this.log(`User: ${data.text}`);
-                        }
-                    },
-                    onBotTranscript: (data) => this.log(`Bot: ${data.text}`),
-                    onMessageError: (error) => console.error('Message error:', error),
-                    onError: (error) => console.error('Error:', error),
+    async connect(): Promise<void> {
+        this.el.reportCard.classList.add('hidden');
+        this.el.transcript.replaceChildren();
+        this.setStatus('Connecting…', 'warn');
+        this.el.connect.disabled = true;
+
+        this.media = new PausableMediaManager();
+        const options: PipecatClientOptions = {
+            transport: new WebSocketTransport({ mediaManager: this.media }),
+            enableMic: true,
+            enableCam: false,
+            callbacks: {
+                onConnected: () => {
+                    this.setStatus('Connected', 'on');
+                    this.setButtons(true);
                 },
-            };
-            this.pcClient = new PipecatClient(PipecatConfig);
-            // @ts-ignore
-            window.pcClient = this.pcClient; // Expose for debugging
-            this.setupTrackListeners();
+                onDisconnected: () => {
+                    this.setStatus('Disconnected', 'off');
+                    this.paused = false;
+                    this.setButtons(false);
+                    this.el.speaking.classList.add('hidden');
+                    this.el.pausedBanner.classList.add('hidden');
+                    this.client = null;
+                    void this.showReport();
+                },
+                onBotReady: () => this.log('bot ready'),
+                onServerMessage: (data: any) => {
+                    if (data?.type === 'state') this.renderState(data as LessonState);
+                },
+                onUserTranscript: (data) => {
+                    if (data.final) this.addTranscript('user', data.text);
+                },
+                onBotStartedSpeaking: () => {
+                    this.botLine = null;
+                    if (!this.paused) this.el.speaking.classList.remove('hidden');
+                },
+                onBotStoppedSpeaking: () => {
+                    this.botLine = null;
+                    this.el.speaking.classList.add('hidden');
+                },
+                onBotTtsText: (data) => {
+                    if (!this.botLine) this.botLine = this.addTranscript('bot', '');
+                    this.botLine.textContent = `${this.botLine.textContent} ${data.text}`.trim();
+                    this.el.transcript.scrollTop = this.el.transcript.scrollHeight;
+                },
+                onError: (error) => this.log(`error: ${JSON.stringify(error)}`),
+                onMessageError: (error) => this.log(`message error: ${JSON.stringify(error)}`),
+            },
+        };
 
-            this.log('Initializing devices...');
-            await this.pcClient.initDevices();
-
-            this.log('Connecting to bot...');
-            await this.pcClient.startBotAndConnect({
-                // The baseURL and endpoint of your bot server that the client will connect to
-                endpoint: 'http://localhost:7860/connect',
-            });
-
-            const timeTaken = Date.now() - startTime;
-            this.log(`Connection complete, timeTaken: ${timeTaken}`);
+        try {
+            this.client = new PipecatClient(options);
+            (window as any).pcClient = this.client;
+            await this.client.initDevices();
+            await this.client.startBotAndConnect({ endpoint: `${SERVER}/connect` });
+            this.addTranscript('sys', 'Connected. The lesson will begin in a moment.');
         } catch (error) {
-            this.log(`Error connecting: ${(error as Error).message}`);
-            this.updateStatus('Error');
-            // Clean up if there's an error
-            if (this.pcClient) {
-                try {
-                    await this.pcClient.disconnect();
-                } catch (disconnectError) {
-                    this.log(`Error during disconnect: ${disconnectError}`);
-                }
-            }
+            this.log(`connect failed: ${(error as Error).message}`);
+            this.setStatus('Error', 'off');
+            this.setButtons(false);
+            this.client = null;
         }
     }
 
-    /**
-     * Disconnect from the bot and clean up media resources
-     */
-    public async disconnect(): Promise<void> {
-        if (this.pcClient) {
-            try {
-                await this.pcClient.disconnect();
-                this.pcClient = null;
-                if (
-                    this.botAudio.srcObject &&
-                    'getAudioTracks' in this.botAudio.srcObject
-                ) {
-                    this.botAudio.srcObject
-                        .getAudioTracks()
-                        .forEach((track) => track.stop());
-                    this.botAudio.srcObject = null;
-                }
-            } catch (error) {
-                this.log(`Error disconnecting: ${(error as Error).message}`);
-            }
+    async disconnect(): Promise<void> {
+        if (!this.client) return;
+        try {
+            await this.media?.resumePlayback();
+            await this.client.disconnect();
+        } catch (error) {
+            this.log(`disconnect failed: ${(error as Error).message}`);
+        }
+    }
+
+    // ---- pause / resume ----------------------------------------------------
+
+    async pause(): Promise<void> {
+        if (!this.client || this.paused) return;
+        this.paused = true;
+        this.setButtons(true);
+        this.client.enableMic(false);
+        await this.media?.pausePlayback();
+        this.client.sendClientMessage('pause');
+        this.addTranscript('sys', 'Paused');
+        this.log('pause sent');
+    }
+
+    async resume(): Promise<void> {
+        if (!this.client || !this.paused) return;
+        this.paused = false;
+        this.setButtons(true);
+        await this.media?.resumePlayback();
+        this.client.sendClientMessage('resume');
+        this.client.enableMic(true);
+        this.addTranscript('sys', 'Resumed');
+        this.log('resume sent');
+    }
+
+    // ---- report ------------------------------------------------------------
+
+    private async showReport(): Promise<void> {
+        // The server prints the report on disconnect; give it a moment then fetch it for display.
+        await new Promise((r) => setTimeout(r, 800));
+        try {
+            const res = await fetch(`${SERVER}/report/latest`);
+            const report = await res.json();
+            if (report.empty) return;
+            this.el.report.textContent = formatReport(report);
+            this.el.reportCard.classList.remove('hidden');
+        } catch (error) {
+            this.log(`report fetch failed: ${(error as Error).message}`);
         }
     }
 }
 
-declare global {
-    interface Window {
-        WebsocketClientApp: typeof WebsocketClientApp;
+function formatReport(r: any): string {
+    const lines: string[] = [];
+    lines.push(`Duration ${r.duration_seconds}s · user turns ${r.turns.user} · bot turns ${r.turns.bot}`);
+    const resp = r.latency?.user_to_bot_response;
+    if (resp?.n) lines.push(`User → bot response: avg ${resp.avg}s  p95 ${resp.p95}s  (n=${resp.n})`);
+    for (const [proc, s] of Object.entries<any>(r.latency?.ttfb ?? {})) {
+        lines.push(`TTFB ${proc}: avg ${s.avg}s  max ${s.max}s  (n=${s.n})`);
     }
+    for (const [model, t] of Object.entries<any>(r.llm_tokens ?? {})) {
+        lines.push(`LLM ${model}: ${t.calls} calls · ${t.prompt} prompt + ${t.completion} completion = ${t.total} tokens`);
+    }
+    lines.push(`TTS: ${r.tts.calls} requests, ${r.tts.characters} chars · STT: ${r.stt.audio_seconds}s audio`);
+    if (r.tool_calls && Object.keys(r.tool_calls).length) lines.push(`Tools: ${JSON.stringify(r.tool_calls)}`);
+    if (r.events && Object.keys(r.events).length) lines.push(`Events: ${JSON.stringify(r.events)}`);
+    if (r.controller) lines.push(`Lesson: ${JSON.stringify(r.controller)}`);
+    lines.push(`Estimated cost: $${r.estimated_cost_usd}`);
+    return lines.join('\n');
 }
 
 window.addEventListener('DOMContentLoaded', () => {
-    window.WebsocketClientApp = WebsocketClientApp;
-    new WebsocketClientApp();
+    new TutorApp();
 });

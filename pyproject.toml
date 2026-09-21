@@ -1,11 +1,26 @@
 [project]
-name = "agent"
-version = "0.1.0"
-description = "Add your description here"
+name = "tutor-agent"
+version = "0.2.0"
+description = "Tutor Bot: a Pipecat + OpenAI voice agent that teaches a class about natural disasters"
 readme = "README.md"
-requires-python = "==3.11.14"
+requires-python = ">=3.11,<3.12"
 dependencies = [
     "python-dotenv",
     "uvicorn",
-    "pipecat-ai[silero,websocket,openai]>=0.0.102",
+    "pipecat-ai[silero,websocket,openai]>=1.11.0",
+    "numpy",
 ]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+    "pytest-asyncio>=1.4.0",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+markers = [
+    "eval: LLM-as-a-judge evaluations that call OpenAI (run with: pytest evals -m eval)",
+]
+filterwarnings = ["ignore::DeprecationWarning"]

@@ -1,20 +1,18 @@
-import asyncio
-from typing import List
-import os
+"""Tutor Bot pipeline wiring (Pipecat + OpenAI only).
 
-from pipecat.observers.base_observer import BaseObserver, FramePushed
+Pipeline:
+  transport.in -> STT -> SafetyProcessor -> user aggregator -> ContextAugmenter
+    -> LLM -> TTS -> PauseGate -> transport.out -> assistant aggregator
+
+Business logic lives in the framework-free `tutor` package; this module only wires it in.
+"""
+
+from dataclasses import dataclass
+
 from dotenv import load_dotenv
 from loguru import logger
 from pipecat.audio.vad.silero import SileroVADAnalyzer
 from pipecat.audio.vad.vad_analyzer import VADParams
-from pipecat.frames.frames import (
-    BotStartedSpeakingFrame,
-    BotStoppedSpeakingFrame,
-    CancelFrame,
-    EndFrame,
-    LLMMessagesAppendFrame,
-    UserStartedSpeakingFrame, StartFrame,
-)
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.runner import PipelineRunner
 from pipecat.pipeline.task import PipelineParams, PipelineTask
@@ -29,169 +27,70 @@ from pipecat.services.openai.stt import OpenAIRealtimeSTTService
 from pipecat.services.openai.tts import OpenAITTSService
 from pipecat.transports.websocket.fastapi import FastAPIWebsocketParams, FastAPIWebsocketTransport
 
+from tutor.config import Settings
+from tutor.controller import PresentationController
+from tutor.knowledge.embedder import OpenAIEmbedder
+from tutor.knowledge.store import KnowledgeBase, VectorStore
+from tutor.metrics import MetricsCollector, render_report
+from tutor.processors.context_augmenter import ContextAugmenter
+from tutor.processors.metrics_observer import MetricsObserver
+from tutor.processors.pause_gate import PauseGate
+from tutor.processors.presentation_driver import PresentationDriver
+from tutor.processors.safety_processor import PausedUserMuteStrategy, SafetyProcessor
+from tutor.prompts import build_system_prompt
+from tutor.safety import OpenAIModerator, SafetyVerdict
+from tutor.tools import build_tools
+from tutor.transcripts import TranscriptRecorder
+
 load_dotenv(override=True)
 
+# Most recent session report, exposed by main.py at GET /report/latest for the UI.
+LAST_REPORT: dict = {}
 
-SLIDE_SYSTEM_MESSAGES: List[str] = [
-    # Slide 1 – welcome & overview
-    (
-        "SLIDE 1: WELCOME & OVERVIEW\n\n"
-        "Welcome the audience and briefly introduce the topic: Natural Disasters. "
-        "Explain that this presentation will walk through what natural disasters are, why they occur, "
-        "and how they affect people and the environment. "
-        "Mention that questions are welcome at any time and that you will continue guiding them through the slides."
-    ),
-    # Slide 2 – what are natural disasters
-    (
-        "SLIDE 2: WHAT ARE NATURAL DISASTERS\n\n"
-        "Explain that natural disasters are extreme natural events that cause major damage to life, property, "
-        "or the environment. Examples include earthquakes, floods, hurricanes, volcanic eruptions, and droughts. "
-        "Emphasize that these events are caused by natural processes of the Earth."
-    ),
-    # Slide 3 – why they happen
-    (
-        "SLIDE 3: WHY NATURAL DISASTERS HAPPEN\n\n"
-        "Describe the main reasons natural disasters occur: movement of tectonic plates, extreme weather patterns, "
-        "volcanic activity, and climate-related changes. "
-        "Briefly mention that some disasters are sudden while others develop slowly over time."
-    ),
-    # Slide 4 – major types
-    (
-        "SLIDE 4: MAJOR TYPES OF NATURAL DISASTERS\n\n"
-        "Introduce the most common categories such as earthquakes, floods, cyclones, wildfires, landslides, "
-        "and volcanic eruptions. "
-        "Explain that each type has different causes and impacts depending on geography and climate."
-    ),
-    # Slide 5 – impacts on people
-    (
-        "SLIDE 5: IMPACT ON PEOPLE\n\n"
-        "Explain how natural disasters affect communities: loss of life, injuries, destruction of homes, "
-        "and displacement of families. "
-        "Also mention disruption to healthcare, education, and daily life."
-    ),
-    # Slide 6 – environmental effects
-    (
-        "SLIDE 6: ENVIRONMENTAL EFFECTS\n\n"
-        "Describe how natural disasters affect ecosystems: deforestation from wildfires, flooding of habitats, "
-        "soil erosion, and pollution of water sources. "
-        "Mention that while disasters cause destruction, some also reshape landscapes and ecosystems."
-    ),
-    # Slide 7 – preparedness and safety
-    (
-        "SLIDE 7: PREPAREDNESS AND SAFETY\n\n"
-        "Explain how preparation can reduce damage and save lives. "
-        "Discuss early warning systems, evacuation plans, emergency kits, and community awareness. "
-        "Highlight that education and planning are key to disaster resilience."
-    ),
-    # Slide 8 – conclusion & discussion
-    (
-        "SLIDE 8: CONCLUSION & DISCUSSION\n\n"
-        "Summarize that natural disasters are powerful natural events that can have serious impacts on society "
-        "and the environment. "
-        "Emphasize the importance of preparedness, scientific understanding, and community cooperation. "
-        "Invite the audience to ask questions or request clarification on any slide."
-    ),
-]
+TTS_INSTRUCTIONS = (
+    "You are a warm, upbeat teacher speaking to a class of 10 to 14 year olds. "
+    "Clear, natural pace, friendly and encouraging."
+)
 
-class PresentationObserver0(BaseObserver):
-    """Observer that advances slides after 5 seconds of bot silence."""
 
-    def __init__(self):
-        super().__init__()
-        self.current_slide = -1
-        self.task: PipelineTask | None = None
-        self._is_bot_speaking = False
-        self._silence_timer: asyncio.TimerHandle | None = None
-        self._user_spoke_since_last_slide = False
-
-    def set_task(self, task: PipelineTask):
-        self.task = task
-
-    def _cancel_silence_timer(self):
-        if self._silence_timer:
-            self._silence_timer.cancel()
-            self._silence_timer = None
-
-    def _schedule_silence_check(self):
-        # Schedule a check 5 seconds after the bot stops speaking.
-        self._cancel_silence_timer()
-        loop = asyncio.get_event_loop()
-        self._silence_timer = loop.call_later(
-            3.0,
-            lambda: asyncio.create_task(self._on_silence_timeout()),
+def load_knowledge(settings: Settings) -> KnowledgeBase | None:
+    store = VectorStore.load(settings.knowledge_index)
+    if len(store) == 0:
+        logger.warning(
+            f"[knowledge] no index at {settings.knowledge_index}; run `uv run python -m tutor.knowledge.ingest`"
         )
-
-    async def _on_silence_timeout(self):
-        if not self._is_bot_speaking:
-            if self._user_spoke_since_last_slide:
-                logger.info("3 seconds silence after user spoke; staying on slide and instructing AI to continue.")
-                await self.continue_current_slide()
-            else:
-                logger.info("3 seconds of bot silence detected; queuing next slide.")
-                await self.go_to_next_slide()
-
-    async def on_push_frame(self, data: FramePushed):
-        frame = data.frame
-
-        if isinstance(frame, StartFrame):
-            # Pipeline just started, force start with first slide
-            await self._on_silence_timeout()
-
-        elif isinstance(frame, BotStartedSpeakingFrame):
-            self._is_bot_speaking = True
-            self._cancel_silence_timer()
-
-        elif isinstance(frame, UserStartedSpeakingFrame):
-            self._user_spoke_since_last_slide = True
-            self._cancel_silence_timer()
-
-        elif isinstance(frame, BotStoppedSpeakingFrame):
-            self._is_bot_speaking = False
-            self._schedule_silence_check()
-
-        elif isinstance(frame, (EndFrame, CancelFrame)):
-            # Pipeline is ending; stop any pending timers.
-            self._cancel_silence_timer()
-
-        # Observers are side-effect-only; nothing to push downstream.
-
-    async def continue_current_slide(self):
-        """Instruct the AI to stay on the current slide and continue where it left off."""
-        if self.current_slide < 0 or self.current_slide >= len(SLIDE_SYSTEM_MESSAGES):
-            return
-        self._user_spoke_since_last_slide = False
-        slide_num = self.current_slide + 1
-        slide_content = SLIDE_SYSTEM_MESSAGES[self.current_slide]
-        slide_title = slide_content.split("\n\n")[0].strip() if slide_content else f"Slide {slide_num}"
-        new_messages = [
-            {
-                "role": "system",
-                "content": (
-                    f"You are still on {slide_title}. Continue presenting this slide where you left off. "
-                    "Do not repeat what you already said; pick up from there."
-                ),
-            }
-        ]
-        await self.task.queue_frames([LLMMessagesAppendFrame(messages=new_messages, run_llm=True)])
-
-    async def go_to_next_slide(self):
-        self.current_slide += 1
-        self._user_spoke_since_last_slide = False
-        new_messages = []
-        if self.current_slide < len(SLIDE_SYSTEM_MESSAGES) - 1:
-            print(f"Adding slide {self.current_slide} to context")
-            new_messages.append({"role": "system", "content": SLIDE_SYSTEM_MESSAGES[self.current_slide]})
-        elif self.current_slide == len(SLIDE_SYSTEM_MESSAGES) - 1:
-            print(f"Adding goodbye slide to context")
-            new_messages.append({"role": "system", "content": "Say goodbye and end the presentation."})
-
-        if len(new_messages) > 0:
-            await self.task.queue_frames([LLMMessagesAppendFrame(messages=new_messages, run_llm=True)])
-        else:
-            logger.critical("NO SLIDE TO INSERT")
+        return None
+    embedder = OpenAIEmbedder(api_key=settings.openai_api_key, model=store.model or settings.embedding_model)
+    logger.info(f"[knowledge] loaded {len(store)} chunks (model={store.model})")
+    return KnowledgeBase(store, embedder, k=settings.retrieval_k, min_score=settings.retrieval_min_score)
 
 
-async def run_bot(websocket_client):
+@dataclass
+class Session:
+    task: PipelineTask
+    controller: PresentationController
+    driver: PresentationDriver
+    collector: MetricsCollector
+    recorder: TranscriptRecorder
+    context: LLMContext
+    settings: Settings
+
+    def finish(self) -> dict:
+        self.driver.shutdown()
+        self.collector.finish()
+        report = self.collector.report()
+        report["controller"] = self.controller.stats.__dict__.copy()
+        report["session_id"] = self.recorder.session_id
+        self.recorder.session_ended(metrics=report, controller_stats=self.controller.stats.__dict__.copy())
+        LAST_REPORT.clear()
+        LAST_REPORT.update(report)
+        return report
+
+
+def build_session(websocket_client, settings: Settings | None = None) -> Session:
+    """Construct the whole pipeline. No network calls happen here."""
+    settings = settings or Settings()
+
     ws_transport = FastAPIWebsocketTransport(
         websocket=websocket_client,
         params=FastAPIWebsocketParams(
@@ -202,39 +101,70 @@ async def run_bot(websocket_client):
         ),
     )
 
-    messages = []
-
     stt = OpenAIRealtimeSTTService(
-        api_key=os.getenv("OPENAI_API_KEY"),
-        model="gpt-4o-transcribe",
+        api_key=settings.openai_api_key,
+        settings=OpenAIRealtimeSTTService.Settings(
+            model=settings.stt_model,
+            prompt="A school lesson about natural disasters: earthquakes, tsunamis, volcanoes, floods, hurricanes.",
+        ),
     )
-
     tts = OpenAITTSService(
-        api_key=os.getenv("OPENAI_API_KEY"),
-        model="gpt-4o-mini-tts",
-        voice="alloy",
-        instructions="AI presenter for business people. Speak fast.",
+        api_key=settings.openai_api_key,
+        settings=OpenAITTSService.Settings(
+            model=settings.tts_model, voice=settings.tts_voice, instructions=TTS_INSTRUCTIONS
+        ),
     )
-
     llm = OpenAILLMService(
-        api_key=os.getenv("OPENAI_API_KEY"),
-        model="gpt-4o",
+        api_key=settings.openai_api_key,
+        settings=OpenAILLMService.Settings(model=settings.llm_model, temperature=0.6),
     )
 
-    context = LLMContext(messages)
-
-    # Stricter VAD to reduce false "user spoke" from background noise: higher confidence,
-    # longer sustained speech before trigger, higher minimum volume.
-    vad_params = VADParams(
-        confidence=0.85,
-        start_secs=0.45,
-        stop_secs=0.35,
-        min_volume=0.7,
+    # ---- business logic ---------------------------------------------------
+    controller = PresentationController(max_idle_prompts=settings.max_idle_prompts)
+    collector = MetricsCollector()
+    recorder = TranscriptRecorder(settings.transcript_dir)
+    gate = PauseGate()
+    driver = PresentationDriver(
+        controller,
+        gate,
+        recorder=recorder,
+        collector=collector,
+        slide_gap_secs=settings.slide_gap_secs,
+        stall_secs=settings.stall_secs,
+        qna_idle_secs=settings.qna_idle_secs,
     )
+    tools = build_tools(controller, driver)
+    knowledge = load_knowledge(settings)
+
+    def on_safety_block(text: str, verdict: SafetyVerdict) -> None:
+        collector.record_event("safety_block")
+        recorder.event(
+            "safety_block",
+            category=verdict.category.value if verdict.category else None,
+            slide=controller.slide_number,
+            mode=controller.mode.value,
+        )
+        # A blocked interruption still needs the slide to be finished afterwards.
+        controller.resume_after_reply = controller.interrupted_mid_slide
+
+    def on_retrieval(query: str, passages: list[str]) -> None:
+        if passages:
+            collector.record_event("knowledge_hits", len(passages))
+            recorder.event("retrieval", query=query, passages=len(passages))
+
+    moderator = OpenAIModerator(api_key=settings.openai_api_key).check if settings.use_moderation_api else None
+    safety = SafetyProcessor(on_block=on_safety_block, moderator=moderator)
+    augmenter = ContextAugmenter(controller, knowledge, on_retrieval=on_retrieval)
+
+    system_prompt = build_system_prompt(learned_guidance=settings.learned_guidance())
+    context = LLMContext([{"role": "system", "content": system_prompt}], tools=tools)
+
+    vad_params = VADParams(confidence=0.8, start_secs=0.4, stop_secs=0.4, min_volume=0.6)
     context_aggregator = LLMContextAggregatorPair(
         context,
         user_params=LLMUserAggregatorParams(
             vad_analyzer=SileroVADAnalyzer(params=vad_params),
+            user_mute_strategies=[PausedUserMuteStrategy(lambda: controller.paused)],
         ),
     )
 
@@ -242,35 +172,94 @@ async def run_bot(websocket_client):
         [
             ws_transport.input(),
             stt,
+            safety,
             context_aggregator.user(),
+            augmenter,
             llm,
             tts,
+            gate,
             ws_transport.output(),
             context_aggregator.assistant(),
         ]
     )
 
-    presentation_observer0 = PresentationObserver0()
     task = PipelineTask(
         pipeline,
-        params=PipelineParams(
-            allow_interruptions=True,
-            enable_metrics=True,
-            enable_usage_metrics=True,
-        ),
-        observers=[presentation_observer0],
-        enable_turn_tracking=False
+        params=PipelineParams(enable_metrics=True, enable_usage_metrics=True),
+        observers=[driver, MetricsObserver(collector)],
+        idle_timeout_secs=900,
     )
-    presentation_observer0.set_task(task)
+    driver.set_task(task)
+
+    # ---- UI <-> agent messaging (RTVI) -------------------------------------
+    async def push_state(snapshot: dict) -> None:
+        await task.rtvi.send_server_message({"type": "state", **snapshot})
+
+    driver.add_state_listener(push_state)
+
+    @task.rtvi.event_handler("on_client_ready")
+    async def on_client_ready(rtvi):
+        await driver.start()
+
+    @task.rtvi.event_handler("on_client_message")
+    async def on_client_message(rtvi, msg):
+        if msg.type == "pause":
+            changed = await driver.pause()
+        elif msg.type == "resume":
+            changed = await driver.resume()
+        elif msg.type == "state":
+            changed = True
+            await push_state(controller.snapshot())
+        else:
+            await rtvi.send_error_response(msg, f"unknown message type {msg.type!r}")
+            return
+        await rtvi.send_server_response(msg, {"ok": True, "changed": changed, **controller.snapshot()})
+
+    # ---- transcript recording --------------------------------------------
+    @context_aggregator.user().event_handler("on_user_turn_message_added")
+    async def on_user_turn(aggregator, message):
+        recorder.user(
+            message.content,
+            slide=controller.slide_number,
+            mode=controller.mode.value,
+            interrupted=controller.interrupted_mid_slide,
+        )
+
+    @context_aggregator.assistant().event_handler("on_assistant_turn_stopped")
+    async def on_assistant_turn(aggregator, message):
+        if message.content:
+            recorder.bot(
+                message.content,
+                slide=controller.slide_number,
+                mode=controller.mode.value,
+                interrupted=message.interrupted,
+            )
 
     @ws_transport.event_handler("on_client_connected")
-    async def on_client_connected():
+    async def on_client_connected(transport, client):
         logger.info("[transport] client connected")
+        recorder.session_started(llm=settings.llm_model, stt=settings.stt_model, tts=settings.tts_model)
 
     @ws_transport.event_handler("on_client_disconnected")
-    async def on_client_disconnected():
+    async def on_client_disconnected(transport, client):
         logger.info("[transport] client disconnected")
         await task.cancel()
 
+    return Session(task, controller, driver, collector, recorder, context, settings)
+
+
+async def run_bot(websocket_client, settings: Settings | None = None):
+    session = build_session(websocket_client, settings)
     runner = PipelineRunner(handle_sigint=False)
-    await runner.run(task)
+    try:
+        await runner.run(session.task)
+    finally:
+        report = session.finish()
+        stats = session.controller.stats
+        print(render_report(report))
+        print(
+            f"Lesson: slides_presented={stats.slides_presented} user_turns={stats.user_turns} "
+            f"interruptions={stats.interruptions} jumps={stats.jumps} pauses={stats.pauses} "
+            f"stalls_recovered={stats.stalls_recovered}\n"
+            f"Transcript: {session.recorder.path}"
+        )

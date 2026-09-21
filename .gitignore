@@ -227,3 +227,7 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+# Tutor bot runtime data
+data/transcripts/*.jsonl
+data/learned/judgements.json
+frontend/dist
