@@ -1,6 +1,5 @@
-import json
 
-from tutor.improve.analyzer import analyze_directory, analyze_entries, analyze_transcripts
+from tutor.improve.analyzer import analyze_directory, analyze_entries
 from tutor.transcripts import TranscriptRecorder
 
 

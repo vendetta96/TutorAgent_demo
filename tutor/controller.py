@@ -61,7 +61,6 @@ class PresentationController:
     resume_after_reply: bool = False
     completed_slides: set[int] = field(default_factory=set)
     stats: ControllerStats = field(default_factory=ControllerStats)
-    history: list[str] = field(default_factory=list)
 
     # ---- properties -----------------------------------------------------
 
@@ -82,12 +81,10 @@ class PresentationController:
     # ---- lifecycle ------------------------------------------------------
 
     def start(self) -> Action:
-        self._log("start")
         self.mode = Mode.PRESENTING
         return self._present(1, reason="start")
 
     def end(self) -> None:
-        self._log("end")
         self.mode = Mode.ENDED
 
     # ---- speech events --------------------------------------------------
@@ -108,7 +105,6 @@ class PresentationController:
         if self.mode is Mode.PRESENTING and self.bot_speaking:
             self.interrupted_mid_slide = True
             self.stats.interruptions += 1
-            self._log(f"interrupted on slide {self.slide_number}")
 
     def on_user_stopped_speaking(self) -> None:
         self.user_speaking = False
@@ -129,7 +125,6 @@ class PresentationController:
             self.resume_after_reply = False
             if self.interrupted_mid_slide:
                 self.interrupted_mid_slide = False
-                self._log(f"continue slide {self.slide_number} after safety reply")
                 return Action(ActionKind.CONTINUE_SLIDE, self.current_slide, "finish slide after safety reply")
         self.completed_slides.add(self.slide_number)
         if self.is_last_slide:
@@ -172,14 +167,12 @@ class PresentationController:
             return False
         self.paused = True
         self.stats.pauses += 1
-        self._log("pause")
         return True
 
     def resume(self) -> Action | None:
         if not self.paused:
             return None
         self.paused = False
-        self._log("resume")
         if self.mode is Mode.PRESENTING and not self.bot_speaking and self.slide_started_speaking:
             return Action(ActionKind.SCHEDULE_ADVANCE, self.current_slide, "resumed after slide finished")
         return None
@@ -191,7 +184,6 @@ class PresentationController:
         if self.mode is not Mode.PRESENTING or self.paused or self.bot_speaking or self.user_speaking:
             return None
         self.stats.stalls_recovered += 1
-        self._log(f"stall on slide {self.slide_number}")
         if not self.slide_started_speaking:
             return self._present(self.slide_number or 1, reason="stall: slide never started")
         return Action(ActionKind.CONTINUE_SLIDE, self.current_slide, "stall: continue slide")
@@ -201,7 +193,6 @@ class PresentationController:
             return None
         self.stats.idle_prompts += 1
         if self.stats.idle_prompts > self.max_idle_prompts:
-            self._log("idle limit reached")
             return Action(ActionKind.END_SESSION, reason="no questions after repeated prompts")
         return Action(ActionKind.IDLE_PROMPT, reason=f"idle prompt {self.stats.idle_prompts}")
 
@@ -232,15 +223,10 @@ class PresentationController:
         self.resume_after_reply = False
         self.slide_started_speaking = False
         self.stats.slides_presented += 1
-        self._log(f"present slide {number} ({reason})")
         return Action(ActionKind.PRESENT_SLIDE, self.current_slide, reason)
 
     def _enter_qna(self, *, reason: str) -> Action:
         self.mode = Mode.QNA
         self.interrupted_mid_slide = False
         self.stats.idle_prompts = 0
-        self._log(f"enter qna ({reason})")
         return Action(ActionKind.ENTER_QNA, self.current_slide, reason)
-
-    def _log(self, entry: str) -> None:
-        self.history.append(entry)

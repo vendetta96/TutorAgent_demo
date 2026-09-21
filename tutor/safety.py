@@ -29,8 +29,6 @@ class SafetyVerdict:
     category: SafetyCategory | None = None
     reply: str | None = None
     matched: str | None = None
-    # When True the user's message is dropped entirely rather than answered.
-    drop_message: bool = True
 
 
 _PHONE = re.compile(r"(?<!\d)(?:\+?\d[\s\-().]?){9,14}\d(?!\d)")

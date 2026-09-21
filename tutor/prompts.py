@@ -1,7 +1,7 @@
 """Prompt construction. Pure functions of controller state so they are unit-testable."""
 
 from tutor.controller import Mode, PresentationController
-from tutor.slides import DECK, Slide, deck_outline
+from tutor.slides import DECK, Slide
 
 STATE_MARKER = "[PRESENTER STATE]"
 SLIDE_MARKER = "[SLIDE CONTENT]"
@@ -41,7 +41,7 @@ def build_system_prompt(deck: tuple[Slide, ...] = DECK, learned_guidance: str | 
         slide_marker=SLIDE_MARKER,
         state_marker=STATE_MARKER,
         knowledge_marker=KNOWLEDGE_MARKER,
-        outline="\n".join(f"{s.number}. {s.title}" for s in deck) if deck is not DECK else deck_outline(),
+        outline="\n".join(f"{s.number}. {s.title}" for s in deck),
     )
     if learned_guidance and learned_guidance.strip():
         prompt += (

@@ -27,7 +27,6 @@ class SafetyProcessor(FrameProcessor):
         self._guard = guard or SafetyGuard()
         self._on_block = on_block
         self._moderator = moderator
-        self.blocked_count = 0
 
     async def process_frame(self, frame: Frame, direction: FrameDirection):
         await super().process_frame(frame, direction)
@@ -47,7 +46,6 @@ class SafetyProcessor(FrameProcessor):
         await self.push_frame(frame, direction)
 
     async def _block(self, text: str, verdict: SafetyVerdict) -> None:
-        self.blocked_count += 1
         category = verdict.category.value if verdict.category else "unknown"
         logger.warning(f"[safety] blocked student message (category={category}, matched={verdict.matched!r})")
         if self._on_block:

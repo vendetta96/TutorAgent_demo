@@ -15,7 +15,6 @@ from pipecat.frames.frames import (
     BotStoppedSpeakingFrame,
     CancelFrame,
     EndFrame,
-    Frame,
     FunctionCallResultFrame,
     FunctionCallsStartedFrame,
     LLMFullResponseEndFrame,

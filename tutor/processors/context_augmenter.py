@@ -33,14 +33,12 @@ class ContextAugmenter(FrameProcessor):
         self,
         controller: PresentationController,
         knowledge: KnowledgeBase | None = None,
-        on_user_message: Callable[[str], None] | None = None,
         on_retrieval: Callable[[str, list[str]], None] | None = None,
         **kwargs,
     ):
         super().__init__(**kwargs)
         self._controller = controller
         self._knowledge = knowledge
-        self._on_user_message = on_user_message
         self._on_retrieval = on_retrieval
 
     async def process_frame(self, frame: Frame, direction: FrameDirection):
@@ -59,8 +57,6 @@ class ContextAugmenter(FrameProcessor):
             self._controller.on_user_message(user_text)
             if self._controller.mode is Mode.QNA:
                 self._controller.on_user_activity_in_qna()
-            if self._on_user_message:
-                self._on_user_message(user_text)
             if self._knowledge and self._knowledge.available:
                 try:
                     passages = await self._knowledge.passages(user_text)

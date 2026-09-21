@@ -73,7 +73,6 @@ class Session:
     collector: MetricsCollector
     recorder: TranscriptRecorder
     context: LLMContext
-    settings: Settings
 
     def finish(self) -> dict:
         self.driver.shutdown()
@@ -245,7 +244,7 @@ def build_session(websocket_client, settings: Settings | None = None) -> Session
         logger.info("[transport] client disconnected")
         await task.cancel()
 
-    return Session(task, controller, driver, collector, recorder, context, settings)
+    return Session(task, controller, driver, collector, recorder, context)
 
 
 async def run_bot(websocket_client, settings: Settings | None = None):
